@@ -1,0 +1,319 @@
+self._last_request_ts = 0.0
+        self.client = client or httpx.Client(timeout=20.0, follow_redirects=True)
+
+    # Context manager helpers -------------------------------------------------
+
+    def __enter__(self) -> "ZillowParser":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.close()
+
+    # Public API --------------------------------------------------------------
+
+    def close(self) -> None:
+        try:
+            self.client.close()
+        except Exception:
+            logger.debug("Failed to close HTTP client", exc_info=True)
+
+    def lookup(self, value: str) -> Dict[str, Any]:
+        """
+        Resolve property data from an input that may be an address, URL, or ZPID.
+        """
+        if not value or not value.strip():
+            raise ValueError("Input value is empty.")
+
+        value = value.strip()
+        logger.info("Resolving property for input: %s", value)
+
+        url = self._resolve_input_to_url(value)
+        html = self._fetch(url)
+        if not html:
+            raise RuntimeError(f"Failed to fetch Zillow page for URL: {url}")
+
+        record = self._extract_property_data(html, url)
+
+        if not record.get("zpid"):
+            m = re.search(r"/(\d+)_zpid", url)
+            if m:
+                record["zpid"] = m.group(1)
+
+        if not record.get("url"):
+            record["url"] = url
+
+        if not record.get("address"):
+            record["address"] = value
+
+        return record
+
+    # URL / HTTP helpers ------------------------------------------------------
+
+    def _resolve_input_to_url(self, value: str) -> str:
+        """
+        Detect whether the input is a URL, ZPID, or free-form address and build a Zillow URL.
+        """
+        if value.startswith(("http://", "https://")):
+            return value
+
+        if value.isdigit():
+            # ZPID pattern
+            return f"{self.base_url}/homedetails/{value}_zpid/"
+
+        # Assume address string; use a generic Zillow "homes" pattern
+        slug = slugify_address(value)
+        return f"{self.base_url}/homes/{slug}_rb/"
+
+    def _throttle(self) -> None:
+        if self.rate_delay <= 0:
+            return
+        now = time.time()
+        elapsed = now - self._last_request_ts
+        if elapsed < self.rate_delay:
+            time.sleep(self.rate_delay - elapsed)
+        self._last_request_ts = time.time()
+
+    def _fetch(self, url: str) -> Optional[str]:
+        """
+        Fetch a Zillow HTML page with minimal retry logic.
+        """
+        self._throttle()
+        logger.info("Fetching URL: %s", url)
+
+        try:
+            response = self.client.get(
+                url,
+                headers={"User-Agent": USER_AGENT, "Accept-Language": "en-US,en;q=0.9"},
+            )
+            response.raise_for_status()
+            return response.text
+        except httpx.HTTPStatusError as exc:
+            logger.error(
+                "HTTP error from Zillow (%s): %s", exc.response.status_code, exc
+            )
+        except httpx.HTTPError as exc:
+            logger.error("Network error fetching Zillow page: %s", exc)
+        return None
+
+    # Parsing helpers ---------------------------------------------------------
+
+    def _extract_property_data(self, html: str, url: str) -> Dict[str, Any]:
+        """
+        Extracts a property record from raw HTML.
+        Tries embedded JSON first, then falls back to HTML heuristics.
+        """
+        soup = BeautifulSoup(html, "html.parser")
+
+        data: Dict[str, Any] = {
+            "address": None,
+            "zpid": None,
+            "url": url,
+            "zestimate": None,
+            "rentZestimate": None,
+            "bedrooms": None,
+            "bathrooms": None,
+            "livingArea": None,
+            "lotSize": None,
+            "homeType": None,
+            "yearBuilt": None,
+            "price": None,
+            "status": None,
+        }
+
+        # Address heuristics
+        address = self._extract_address(soup)
+        if address:
+            data["address"] = address
+
+        # Embedded JSON often contains richer property metadata
+        embedded_data = self._extract_from_embedded_json(soup)
+        for key, value in embedded_data.items():
+            if key in data and value is not None:
+                data[key] = value
+
+        # Fallback price from visible HTML if not in JSON
+        if data.get("price") is None:
+            price = self._extract_price_from_html(soup)
+            if price is not None:
+                data["price"] = price
+
+        return data
+
+    def _extract_address(self, soup: BeautifulSoup) -> Optional[str]:
+        # 1) Frequently, headline h1 contains full address on Zillow
+        h1 = soup.find("h1")
+        if h1:
+            text = clean_text(h1.get_text(" ", strip=True))
+            if text:
+                return text
+
+        # 2) Try Open Graph title, which often includes address-like information
+        og_title = soup.find("meta", attrs={"property": "og:title"})
+        if og_title and og_title.get("content"):
+            text = clean_text(og_title["content"])
+            if text:
+                return text
+
+        # 3) Fallback to page title
+        if soup.title and soup.title.string:
+            text = clean_text(soup.title.string)
+            if text:
+                return text
+
+        return None
+
+    def _extract_from_embedded_json(self, soup: BeautifulSoup) -> Dict[str, Any]:
+        """
+        Zillow often embeds a large JSON blob; we search for the first one containing a 'zpid'
+        and then extract relevant keys from it.
+        """
+        candidate_text: Optional[str] = None
+
+        for script in soup.find_all("script"):
+            txt = script.string
+            if not txt:
+                continue
+            if '"zpid"' in txt and '"zestimate"' in txt:
+                candidate_text = txt
+                break
+
+        if not candidate_text:
+            return {}
+
+        # Attempt to isolate JSON payload from surrounding noise (HTML comments, etc.)
+        payload = self._find_json_payload(candidate_text)
+        if not payload:
+            return {}
+
+        try:
+            obj = json.loads(payload)
+        except Exception:
+            logger.debug("Failed to parse embedded JSON; trying relaxed extraction.", exc_info=True)
+            return self._extract_from_json_relaxed(candidate_text)
+
+        record = self._search_property_dict(obj)
+        return self._map_property_dict(record) if record else {}
+
+    def _find_json_payload(self, text: str) -> Optional[str]:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            return None
+        return text[start : end + 1]
+
+    def _extract_from_json_relaxed(self, text: str) -> Dict[str, Any]:
+        """
+        Fallback when strict JSON parsing fails: try to locate individual values by regex.
+        """
+        result: Dict[str, Any] = {}
+        patterns = {
+            "zpid": r'"zpid"\s*:\s*"?(?P<val>\d+)"?',
+            "zestimate": r'"zestimate"\s*:\s*(?P<val>[\d\.]+)',
+            "rentZestimate": r'"rentZestimate"\s*:\s*(?P<val>[\d\.]+)',
+            "bedrooms": r'"bedrooms"\s*:\s*(?P<val>[\d\.]+)',
+            "bathrooms": r'"bathrooms"\s*:\s*(?P<val>[\d\.]+)',
+            "livingArea": r'"livingArea"\s*:\s*(?P<val>[\d\.]+)',
+            "lotSize": r'"lotSize"\s*:\s*(?P<val>[\d\.]+)',
+            "homeType": r'"homeType"\s*:\s*"(?P<val>[^"]+)"',
+            "yearBuilt": r'"yearBuilt"\s*:\s*(?P<val>\d+)',
+            "price": r'"price"\s*:\s*(?P<val>[\d\.]+)',
+            "status": r'"homeStatus"\s*:\s*"(?P<val>[^"]+)"',
+        }
+
+        for key, pattern in patterns.items():
+            m = re.search(pattern, text)
+            if not m:
+                continue
+            val = m.group("val")
+            if key in {"zpid", "yearBuilt", "bedrooms", "bathrooms", "livingArea", "lotSize", "price"}:
+                # Choose int vs float conversion
+                num = parse_float(val)
+                if num is not None and num.is_integer():
+                    result[key] = int(num)
+                else:
+                    result[key] = num
+            elif key in {"zestimate", "rentZestimate"}:
+                result[key] = parse_float(val)
+            else:
+                result[key] = clean_text(val)
+        return result
+
+    def _search_property_dict(self, obj: Any) -> Optional[Dict[str, Any]]:
+        """
+        Recursively walk a JSON object to find a dictionary that looks like a property.
+        """
+        if isinstance(obj, dict):
+            if "zpid" in obj or "zestimate" in obj:
+                return obj
+            for v in obj.values():
+                found = self._search_property_dict(v)
+                if found:
+                    return found
+        elif isinstance(obj, list):
+            for item in obj:
+                found = self._search_property_dict(item)
+                if found:
+                    return found
+        return None
+
+    def _map_property_dict(self, prop: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Normalize Zillow's JSON keys into our standard schema.
+        """
+        mapped: Dict[str, Any] = {}
+
+        mapped["zpid"] = prop.get("zpid")
+        mapped["zestimate"] = parse_float(prop.get("zestimate"))
+        mapped["rentZestimate"] = parse_float(prop.get("rentZestimate"))
+
+        mapped["bedrooms"] = parse_float(prop.get("bedrooms"))
+        if mapped["bedrooms"] is not None and mapped["bedrooms"].is_integer():
+            mapped["bedrooms"] = int(mapped["bedrooms"])
+
+        mapped["bathrooms"] = parse_float(prop.get("bathrooms"))
+        if mapped["bathrooms"] is not None and mapped["bathrooms"].is_integer():
+            mapped["bathrooms"] = float(mapped["bathrooms"])
+
+        mapped["livingArea"] = parse_int(prop.get("livingArea"))
+        mapped["lotSize"] = parse_int(prop.get("lotSize"))
+        mapped["homeType"] = clean_text(str(prop.get("homeType") or "")) or None
+        mapped["yearBuilt"] = parse_int(prop.get("yearBuilt"))
+
+        # Zillow sometimes exposes price under 'price', 'unformattedPrice', etc.
+        price = prop.get("price") or prop.get("unformattedPrice")
+        mapped["price"] = parse_int(price)
+
+        status = prop.get("homeStatus") or prop.get("status")
+        mapped["status"] = clean_text(str(status or "")) or None
+
+        address = None
+        if "streetAddress" in prop or "city" in prop or "state" in prop or "zipcode" in prop:
+            parts = [
+                prop.get("streetAddress") or "",
+                prop.get("city") or "",
+                prop.get("state") or "",
+                prop.get("zipcode") or "",
+            ]
+            address = clean_text(", ".join([p for p in parts if p]))
+        if address:
+            mapped["address"] = address
+
+        return mapped
+
+    def _extract_price_from_html(self, soup: BeautifulSoup) -> Optional[int]:
+        """
+        Try to find a visible price on the page when JSON parsing doesn't provide one.
+        """
+        selectors = [
+            '[data-testid*="price"]',
+            '[data-test*="price"]',
+            'span[itemprop="price"]',
+            'span[data-testid="price"]',
+        ]
+        for selector in selectors:
+            for el in soup.select(selector):
+                text = clean_text(el.get_text(" ", strip=True))
+                price = parse_price(text)
+                if price is not None:
+                    return price
+        return None
