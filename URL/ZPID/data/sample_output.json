@@ -1,0 +1,21 @@
+[
+  {
+    "address": "7254 Wisteria Ln, Lake Wales, FL 33898",
+    "zpid": "110083637",
+    "url": "https://www.zillow.com/homes/8453-FOREST-VALLEY-DR,-COLERAIN-TOWNSHIP-HAM-OH,-45247,-OH_rb/110083637_zpid/",
+    "zestimate": 312400,
+    "bedrooms": 3,
+    "bathrooms": 2,
+    "livingArea": 1680,
+    "lotSize": 7405,
+    "yearBuilt": 1994,
+    "propertyType": "Single Family",
+    "priceHistory": [
+      {
+        "date": "2023-04-06",
+        "event": "Sold",
+        "price": 298000
+      }
+    ]
+  }
+]
