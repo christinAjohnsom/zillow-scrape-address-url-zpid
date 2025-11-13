@@ -1,0 +1,4 @@
+# Example inputs for Zillow Scrape: Address/URL/ZPID
+7254 Wisteria Ln, Lake Wales, FL 33898
+110083637
+https://www.zillow.com/homedetails/8453-FOREST-VALLEY-DR-COLERAIN-TOWNSHIP-HAM-OH-45247/110083637_zpid/
